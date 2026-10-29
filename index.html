@@ -642,6 +642,18 @@ html, body {
 .toast.on { display:block; }
 .toast.err { border-color:#8c3a48; color:#ffc9ce; }
 
+/* ───────────── эко-режим для слабых устройств (iPad 5 / A9) ─────────────
+   Отключаем всё, что заставляет GPU/A9 перерисовывать кадр целиком:
+   свечения, drop-shadow и box-shadow-анимации. Главный поток не должен
+   отбирать время у аудио-потока.                                         */
+.perf-eco #digits { filter:none !important; -webkit-filter:none !important; }
+.perf-eco .recbtn.rec-on { animation:none; -webkit-animation:none; }
+.perf-eco .device { box-shadow:0 0 0 3px #23272d; }
+.perf-eco .pad.act { box-shadow:0 4px 0 rgba(45,58,72,.55), 0 7px 10px rgba(15,22,30,.42); }
+.perf-eco .pad-ext.act span { box-shadow:none; }
+.perf-eco .slot.sel { box-shadow:none; }
+.perf-eco .led-peak { box-shadow:none; }
+
 </style>
 </head>
 <body>
@@ -895,6 +907,7 @@ html, body {
             <div class="ab" data-act="int">Запись внутр.</div>
             <div class="ab ab-danger" data-act="clear">Удалить слот</div>
             <div class="ab ab-danger" data-act="factory">Сброс банка</div>
+            <div class="ab" data-act="perf" id="perfBtn">КАЧЕСТВО: АВТО</div>
             <div class="ab" data-act="help">Как работать</div>
             <div class="ab ab-x" data-act="close">ЗАКРЫТЬ</div>
           </div>
@@ -939,6 +952,54 @@ html, body {
   };
   try { var _sb = localStorage.getItem('sp404_bank'); if (_sb !== null) state.bankIdx = Math.max(0, Math.min(5, +_sb)); } catch (e) {}
 
+  /* ---------- 0.5 Профиль производительности ----------
+     iPad 5 (2017, A9, 2 ядра) не вывозит одновременно 12 голосов, 6
+     полноценных ветвей эффектов, конволюцию на 1.6 с и 2х-оверсэмплинг —
+     аудио-поток не успевает за 128-сэмпловым квантом и звук «хрипит».
+     Профиль урезает ровно то, что дороже всего по CPU.                    */
+  var PERF_LEVELS = [
+    /* 0 ECO  — слабые планшеты/телефоны */
+    { name: 'ECO',  rate: 32000, voices: 6,  os: 'none', irMax: 0.9, irMono: true,
+      lat: 'playback',    paramMs: 45, glow: false, noise: 0.5 },
+    /* 1 НОРМ — средние устройства */
+    { name: 'НОРМ', rate: 44100, voices: 8,  os: '2x',   irMax: 1.6, irMono: true,
+      lat: 'interactive', paramMs: 16, glow: true,  noise: 0.8 },
+    /* 2 МАКС — десктоп/новые планшеты */
+    { name: 'МАКС', rate: 0,     voices: 12, os: '2x',   irMax: 2.4, irMono: false,
+      lat: 'interactive', paramMs: 0,  glow: true,  noise: 0.8 }
+  ];
+  var perf = { auto: true, level: 1, realRate: 0, detect: 1 };
+
+  function perfP() { return PERF_LEVELS[perf.level] || PERF_LEVELS[1]; }
+
+  function detectLevel() {
+    var ua = navigator.userAgent || '';
+    var iOS = /iPad|iPhone|iPod/.test(ua) ||
+              (navigator.platform === 'MacIntel' && (navigator.maxTouchPoints || 0) > 1);
+    var cores = navigator.hardwareConcurrency || 0;
+    if (iOS) {
+      /* iPad 5/6/7 — A9/A10, 2–4 ядра: сразу ECO */
+      if (!cores || cores <= 4) return 0;
+      return 1;
+    }
+    if (cores && cores <= 2) return 0;
+    if (cores && cores <= 4) return 1;
+    return 2;
+  }
+  (function () {
+    var saved = null;
+    try { saved = localStorage.getItem('sp404_perf'); } catch (e) {}
+    if (saved === '0' || saved === '1' || saved === '2') { perf.level = +saved; perf.auto = false; }
+    else { perf.level = detectLevel(); perf.auto = true; perf.detect = perf.level; }
+  })();
+  function applyPerfClass() {
+    try {
+      var h = document.documentElement;
+      if (perf.level === 0) h.classList.add('perf-eco'); else h.classList.remove('perf-eco');
+    } catch (e) {}
+  }
+  applyPerfClass();
+
   /* ---------- 1. Масштаб ---------- */
   var stage = document.getElementById('stage');
   function fit() {
@@ -951,18 +1012,69 @@ html, body {
 
   /* ---------- 2. Аудио-ядро ---------- */
   var AC = window.AudioContext || window.webkitAudioContext;
-  var ctx = null, master = null, noiseBuffer = null, chain = null, internalDest = null;
-  var MAX_VOICES = 12, voices = [];
-  var cur = null, padVoice = {};
+  var ctx = null, master = null, busOut = null, noiseBuffer = null, chain = null, internalDest = null;
+  var MAX_VOICES = 8, voices = [];
+  var cur = null, padVoice = {}, panners = null;
+
+  function syncPerf() {
+    MAX_VOICES = perfP().voices;
+    applyPerfClass();
+  }
+  syncPerf();
+
+  /* Мягкий ограничитель: прозрачен до -3 dBFS, выше — мягкое колено,
+     жёсткий потолок на -0.65 dBFS. Кривая строится один раз. */
+  var softClipCurve = null;
+  function mkSoftClip() {
+    if (softClipCurve) return softClipCurve;
+    var n = 4096, c = new Float32Array(n), i, x, y, ax, t = 0.7;
+    for (i = 0; i < n; i++) {
+      x = (i / (n - 1)) * 2 - 1; ax = Math.abs(x);
+      y = (ax <= t) ? ax : t + (1 - t) * Math.tanh((ax - t) / (1 - t));
+      c[i] = (x < 0) ? -y : y;
+    }
+    softClipCurve = c;
+    return c;
+  }
 
   function ensureCtxQuiet() {
     if (ctx || !AC) return;
+    var p = perfP(), made = null;
+    /* Частота дискретизации — прямой множитель стоимости DSP:
+       32 кГц вместо 48 кГц = минус треть нагрузки на аудио-поток. */
+    if (p.rate) {
+      try { made = new AC({ sampleRate: p.rate, latencyHint: p.lat }); } catch (e) { made = null; }
+      if (made && !made.sampleRate) { try { made.close(); } catch (e2) {} made = null; }
+    }
+    if (!made) {
+      try { made = new AC({ latencyHint: p.lat }); }
+      catch (e) { try { made = new AC(); } catch (e2) { made = null; } }
+    }
+    if (!made) return;
+    ctx = made;
+    perf.realRate = ctx.sampleRate;
     try {
-      ctx = new AC();
       master = ctx.createGain();
       master.gain.value = 0.8;
       master.connect(ctx.destination);
-      var len = Math.floor(ctx.sampleRate * 0.8) | 0;
+
+      /* Выходной каскад: компрессор гасит основную перегрузку от плотной
+         полифонии, мягкий клип — потолок для пиков, которые проскочили
+         атаку компрессора. Раньше тут один компрессор threshold -6/ratio 12:
+         он «зажимал» каждый пик, а всё, что проскакивало, жёстко клипилось
+         в ЦАП — оттуда хрипота и накачка. Порядок важен: клип ПОСЛЕ
+         компрессора, иначе он и есть тот самый жёсткий клип. */
+      var comp = ctx.createDynamicsCompressor();
+      comp.threshold.value = -1.5; comp.knee.value = 4; comp.ratio.value = 9;
+      comp.attack.value = 0.004; comp.release.value = 0.18;
+      var clip = ctx.createWaveShaper();
+      try { clip.oversample = p.os; } catch (e) {}
+      clip.curve = mkSoftClip();
+      comp.connect(clip);
+      clip.connect(master);
+      busOut = comp;
+
+      var len = Math.floor(ctx.sampleRate * p.noise) | 0;
       noiseBuffer = ctx.createBuffer(1, len, ctx.sampleRate);
       var d = noiseBuffer.getChannelData(0);
       for (var i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
@@ -971,6 +1083,7 @@ html, body {
   function initAudio() {
     ensureCtxQuiet();
     if (ctx && ctx.state === 'suspended') { try { ctx.resume(); } catch (e) {} }
+    updatePerfBtn();
   }
 
   function killVoice(v, now, fade) {
@@ -993,7 +1106,11 @@ html, body {
     for (i = voices.length - 1; i >= 0; i--) if (voices[i].end <= now || voices[i].dead) voices.splice(i, 1);
     while (voices.length >= MAX_VOICES) { killVoice(voices.shift(), now, 0.025); }
     var rec = { g: ctx.createGain(), end: endAt, sources: [], dead: false };
-    rec.g.gain.value = 1;
+    /* Разводка по громкости: 12 голосов по 0.9 в сумме давали +20 dBFS и
+       уходили в жёсткий клип ЦАП — ещё один источник хрипоты. Теперь
+       уровень голоса падает с ростом полифонии (как на аналоговом миксе). */
+    var n = voices.length + 1;
+    rec.g.gain.value = 0.9 / Math.pow(n, 0.28);
     voices.push(rec);
     cur = rec;
     return rec;
@@ -1094,22 +1211,44 @@ html, body {
   }
 
   /* ---------- 4. Цепь эффектов ---------- */
+  /* Кривые переиспользуются: при движении ручки раньше на каждый шаг
+     выделялся новый Float32Array(1024) — мусор и паузы на GC. */
+  var curveCache = {}, quantCache = {};
   function mkCurve(dr) {
-    var n = 1024, c = new Float32Array(n), i, x;
     if (dr < 1) dr = 1;
-    var d = Math.tanh(dr);
+    dr = Math.round(dr * 2) / 2;                 /* квант 0.5 — ушей не слышно, кривых в 50 раз меньше */
+    var hit = curveCache[dr];
+    if (hit) return hit;
+    var n = 1024, c = new Float32Array(n), i, x, d = Math.tanh(dr);
     for (i = 0; i < n; i++) { x = (i / (n - 1)) * 2 - 1; c[i] = Math.tanh(dr * x) / d; }
+    curveCache[dr] = c;
     return c;
   }
   function mkQuant(L) {
+    L = Math.max(1, Math.round(L));
+    var hit = quantCache[L];
+    if (hit) return hit;
     var n = 1024, c = new Float32Array(n), i, x;
     for (i = 0; i < n; i++) { x = (i / (n - 1)) * 2 - 1; c[i] = Math.max(-1, Math.min(1, Math.round(x * L) / L)); }
+    quantCache[L] = c;
     return c;
   }
+  function mkShaper(curve, os) {
+    var ws = ctx.createWaveShaper();
+    /* 2х-оверсэмплинг = три прогона фильтров на каждый сэмпл;
+       на ECO отключаем — это самый дорогой узел в цепи после конволюции. */
+    try { ws.oversample = os || perfP().os; } catch (e) {}
+    if (curve) ws.curve = curve;
+    return ws;
+  }
   function mkIR(sec) {
+    var p = perfP();
+    if (sec > p.irMax) sec = p.irMax;
     var rate = ctx.sampleRate, len = Math.max(1, Math.floor(rate * sec));
-    var b = ctx.createBuffer(2, len, rate), ch, i, d, env;
-    for (ch = 0; ch < 2; ch++) {
+    /* Моно-IR вместо стерео = ровно вдвое дешевле конволюция. */
+    var chs = p.irMono ? 1 : 2;
+    var b = ctx.createBuffer(chs, len, rate), ch, i, d, env;
+    for (ch = 0; ch < chs; ch++) {
       d = b.getChannelData(ch);
       for (i = 0; i < len; i++) {
         env = Math.pow(1 - i / len, 2.4);
@@ -1130,11 +1269,7 @@ html, body {
     if (chain) return chain;
     ensureCtxQuiet();
     if (!ctx) return null;
-    var lim = ctx.createDynamicsCompressor();
-    lim.threshold.value = -6; lim.knee.value = 8; lim.ratio.value = 12;
-    lim.attack.value = 0.003; lim.release.value = 0.15;
-    lim.connect(master);
-    var out = ctx.createGain(); out.connect(lim);
+    var out = ctx.createGain(); out.connect(busOut);
     var inn = ctx.createGain();
     chain = { in: inn, out: out, mods: {} };
     chain.mods.lofi   = mkShell(buildLoFi, true);
@@ -1155,39 +1290,109 @@ html, body {
 
   function mkShell(build, full) {
     var i = ctx.createGain(), o = ctx.createGain();
-    var dry = ctx.createGain(); dry.gain.value = 1;
-    var wet = ctx.createGain(); wet.gain.value = 0;
-    i.connect(dry); dry.connect(o);
-    var wIn = ctx.createGain(), wOut = ctx.createGain();
-    i.connect(wIn); wIn.connect(wOut); wOut.connect(wet); wet.connect(o);
-    var s = { input: i, output: o, dry: dry, wet: wet, wIn: wIn, wOut: wOut,
+    /* Пока модуль выключен — прямой провод i→o. Раньше каждая из 6 оболочек
+       держала 6 узлов, итого 36 нод обрабатывались на каждом кванте даже
+       при полностью выключенных эффектах. */
+    i.connect(o);
+    var s = { input: i, output: o, dry: null, wet: null, wIn: null, wOut: null,
               full: !!full, build: build, graph: false, set: null, stop: null,
-              srcs: [], on: false };
+              srcs: [], on: false, _bt: null };
     s.buildGraph = function () {
-      try { s.wIn.disconnect(); } catch (e) {}
-      s.srcs = []; s.set = null;
+      if (!s.dry) {
+        s.dry = ctx.createGain(); s.dry.gain.value = s.full ? 0 : 1;
+        s.wet = ctx.createGain(); s.wet.gain.value = 0;
+        s.wIn = ctx.createGain(); s.wOut = ctx.createGain();
+        s.wIn.connect(s.wOut); s.wOut.connect(s.wet);
+        try { i.disconnect(); } catch (e) {}
+        i.connect(s.dry); s.dry.connect(o);
+        i.connect(s.wIn);
+      } else {
+        try { s.wIn.disconnect(); } catch (e) {}
+        try { s.wIn.connect(s.wOut); } catch (e) {}
+      }
+      s.srcs = []; s.set = null; s.stop = null;
       var old = curLoopSrcs; curLoopSrcs = s.srcs;
       try { s.build(s); } finally { curLoopSrcs = old; }
       s.graph = true;
+      if (s.on) wetOn(s);
       if (s.set) s.set(state.k[0], state.k[1], state.k[2]);
     };
     s.engage = function (on) {
       s.on = on;
       var T = ctx.currentTime;
       if (on && !s.graph) s.buildGraph();
+      if (!s.dry) return;                    /* выключен и не построен — i→o напрямую */
+      if (on) wetOn(s);
       if (s.full) {
-        dry.gain.setTargetAtTime(on ? 0 : 1, T, 0.02);
-        wet.gain.setTargetAtTime(on ? 1 : 0, T, 0.02);
+        s.dry.gain.setTargetAtTime(on ? 0 : 1, T, 0.02);
+        s.wet.gain.setTargetAtTime(on ? 1 : 0, T, 0.02);
         if (on && s.set) s.set(state.k[0], state.k[1], state.k[2]);
       } else {
-        if (on) { if (s.set) s.set(state.k[0], state.k[1], state.k[2]); else wet.gain.setTargetAtTime(1, T, 0.02); }
-        else {
-          dry.gain.setTargetAtTime(1, T, 0.02);
-          wet.gain.setTargetAtTime(0, T, 0.02);
+        if (on) {
+          if (s.set) s.set(state.k[0], state.k[1], state.k[2]);
+          else s.wet.gain.setTargetAtTime(1, T, 0.02);
+        } else {
+          s.dry.gain.setTargetAtTime(1, T, 0.02);
+          s.wet.gain.setTargetAtTime(0, T, 0.02);
         }
       }
+      if (!on) wetOff(s);
     };
     return s;
+  }
+
+  /* Выключенная wet-ветвь физически отсоединяется от выхода: узлы, не
+     связанные с destination, Web Audio не рендерит — выключенный эффект
+     (конволюция, оверсэмплинг, LFO) перестаёт тратить CPU вообще. */
+  function wetOn(s) {
+    if (s._bt) { clearTimeout(s._bt); s._bt = null; }
+    if (!s.wet || s._wconn) return;
+    try { s.wet.connect(s.output); s._wconn = true; } catch (e) {}
+  }
+  function wetOff(s) {
+    if (!s.wet || s.on) return;
+    if (s._bt) clearTimeout(s._bt);
+    s._bt = setTimeout(function () {
+      s._bt = null;
+      if (!s.on) { try { s.wet.disconnect(); s._wconn = false; } catch (e) {} }
+    }, 150);
+  }
+
+  /* Смена профиля: частоту дискретизации можно поменять только пересоздав
+     контекст. Семплы при этом не теряются — AudioBuffer не привязан к
+     контексту, а подписи семплов лежат в IndexedDB. */
+  function hardResetAudio() {
+    var i, k, onList = [], old = ctx;
+    try { if (rec.active) recStop(false); } catch (e) {}
+    if (old) {
+      for (i = 0; i < voices.length; i++) killVoice(voices[i], old.currentTime, 0.02);
+      try { old.suspend(); } catch (e) {}
+      setTimeout(function () { try { old.close(); } catch (e) {} }, 120);
+    }
+    voices = []; cur = null; padVoice = {};
+    ctx = null; master = null; busOut = null; chain = null;
+    noiseBuffer = null; internalDest = null; panners = null;
+    for (k in state.flags) if (state.flags.hasOwnProperty(k) && state.flags[k]) onList.push(k);
+    syncPerf();
+    ensureCtxQuiet();
+    if (!ctx) return;
+    ensureChain();
+    for (i = 0; i < onList.length; i++) setFlag(onList[i], true);
+    if (mfxT) { clearTimeout(mfxT); mfxT = null; }
+    selectMfx(state.mfx, true);
+    applyParams(true);
+  }
+
+  var perfBtnTxt = '', perfBtnEl = null;
+  function updatePerfBtn() {
+    if (perfBtnEl === null) perfBtnEl = document.getElementById('perfBtn');
+    var el = perfBtnEl;
+    if (!el) return;
+    var khz = perf.realRate ? (Math.round(perf.realRate / 100) / 10) : 0;
+    var t = 'КАЧЕСТВО: ' + perfP().name + (khz ? ' · ' + khz + ' кГц' : '');
+    if (t === perfBtnTxt) return;
+    perfBtnTxt = t;
+    el.textContent = t;
   }
 
   function setFlag(key, on) {
@@ -1195,8 +1400,20 @@ html, body {
     if (chain && chain.mods[key]) chain.mods[key].engage(!!on);
   }
 
-  function applyParams() {
+  var lastParamAt = 0, paramTimer = null;
+  function applyParams(force) {
     if (!chain) return;
+    /* Вращение ручки слало десятки setTargetAtTime каждый кадр; на ECO
+       ограничиваем частоту записи параметров — уши не различают, CPU — да. */
+    var gap = perfP().paramMs;
+    if (gap > 0 && !force) {
+      var now = Date.now();
+      if (now - lastParamAt < gap) {
+        if (paramTimer === null) paramTimer = setTimeout(function () { paramTimer = null; applyParams(true); }, gap);
+        return;
+      }
+      lastParamAt = now;
+    }
     var k0 = state.k[0], k1 = state.k[1], k2 = state.k[2], m = chain.mods;
     if (master) master.gain.setTargetAtTime(0.3 + (state.vol / 127) * 0.7, ctx.currentTime, 0.02);
     if (m.filter.on && m.filter.set) m.filter.set(k0, k1, k2);
@@ -1214,7 +1431,7 @@ html, body {
   /* ---- модули тумблеров ---- */
   function buildFilter(s) {
     var lp = ctx.createBiquadFilter(); lp.type = 'lowpass';
-    var ws = ctx.createWaveShaper(); ws.oversample = '2x';
+    var ws = mkShaper();
     var last = -1;
     s.wIn.connect(lp); lp.connect(ws); ws.connect(s.wOut);
     s.set = function (a, b, c) {
@@ -1261,7 +1478,7 @@ html, body {
   }
   function buildLoFi(s) {
     var lp = ctx.createBiquadFilter(); lp.type = 'lowpass';
-    var ws = ctx.createWaveShaper(); var lastL = -1;
+    var ws = mkShaper(null, 'none'); var lastL = -1;
     s.wIn.connect(lp); lp.connect(ws); ws.connect(s.wOut);
     var src = loopNoise(), ng = ctx.createGain(); ng.gain.value = 0;
     src.connect(ng); ng.connect(s.wOut);
@@ -1287,11 +1504,14 @@ html, body {
         if (!s.on) return;
         s.wet.gain.setTargetAtTime(0.45 + (b / 127) * 0.5, ctx.currentTime, 0.03);
         s.dry.gain.setTargetAtTime(0.4, ctx.currentTime, 0.03);
+        /* Пересборка IR — дорогая операция (генерация + normalize на весь
+           хвост): квантуем длину по 0.25 с и реже её пересчитываем. */
         var sec = 0.5 + Math.pow(a / 127, 1.5) * 2.6;
-        if (Math.abs(sec - last) > 0.4) {
+        sec = Math.round(sec * 4) / 4;
+        if (Math.abs(sec - last) >= 0.25) {
           last = sec;
           clearTimeout(s._t);
-          s._t = setTimeout(function () { try { cv.buffer = mkIR(sec); } catch (e) {} }, 300);
+          s._t = setTimeout(function () { try { cv.buffer = mkIR(sec); } catch (e) {} }, 400);
         }
       };
       s.stop = function () { clearTimeout(s._t); };
@@ -1403,7 +1623,7 @@ html, body {
     },
     /* 7 DISTORTION */
     function (s) {
-      var ws = ctx.createWaveShaper(); ws.oversample = '2x';
+      var ws = mkShaper();
       var lp = ctx.createBiquadFilter(); lp.type = 'lowpass';
       var last = -1;
       s.wIn.connect(ws); ws.connect(lp); lp.connect(s.wOut);
@@ -1418,7 +1638,7 @@ html, body {
     },
     /* 8 OVERDRIVE */
     function (s) {
-      var ws = ctx.createWaveShaper(); ws.oversample = '2x';
+      var ws = mkShaper();
       var lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 5200;
       var last = -1;
       s.wIn.connect(ws); ws.connect(lp); lp.connect(s.wOut);
@@ -1433,7 +1653,7 @@ html, body {
     },
     /* 9 FUZZ */
     function (s) {
-      var ws = ctx.createWaveShaper(); ws.oversample = 'none';
+      var ws = mkShaper(null, 'none');
       var hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 110;
       var last = -1;
       s.wIn.connect(ws); ws.connect(hp); hp.connect(s.wOut);
@@ -1464,7 +1684,7 @@ html, body {
     },
     /* 11 OCTAVE */
     function (s) {
-      var ws = ctx.createWaveShaper();
+      var ws = mkShaper(null, 'none');
       var n = 1024, c = new Float32Array(n), i, x;
       for (i = 0; i < n; i++) { x = (i / (n - 1)) * 2 - 1; c[i] = Math.abs(x) * 2 - 1; }
       ws.curve = c;
@@ -1508,7 +1728,7 @@ html, body {
     /* 14 LO-FI */
     function (s) {
       var lp = ctx.createBiquadFilter(); lp.type = 'lowpass';
-      var ws = ctx.createWaveShaper(); var last = -1;
+      var ws = mkShaper(null, 'none'); var last = -1;
       s.wIn.connect(lp); lp.connect(ws); ws.connect(s.wOut);
       var src = loopNoise(), ng = ctx.createGain(); ng.gain.value = 0;
       src.connect(ng); ng.connect(s.wOut);
@@ -1538,7 +1758,7 @@ html, body {
     /* 16 RADIO TUNING */
     function (s) {
       var bp = ctx.createBiquadFilter(); bp.type = 'bandpass';
-      var ws = ctx.createWaveShaper(); var last = -1;
+      var ws = mkShaper(); var last = -1;
       var src = loopNoise(), ng = ctx.createGain(); ng.gain.value = 0.03;
       s.wIn.connect(bp); bp.connect(ws); ws.connect(s.wOut);
       src.connect(ng); ng.connect(s.wOut);
@@ -1687,8 +1907,7 @@ html, body {
     },
     /* 24 DJFX LOOPER */
     function (s) {
-      var d = ctx.createDelay(1), fb = ctx.createGain(), ws = ctx.createWaveShaper();
-      ws.curve = mkQuant(7);
+      var d = ctx.createDelay(1), fb = ctx.createGain(), ws = mkShaper(mkQuant(7), 'none');
       s.wIn.connect(d); d.connect(ws); ws.connect(fb); fb.connect(d); d.connect(s.wOut);
       s.set = function (a, b, c) {
         if (!s.on) return;
@@ -1714,8 +1933,8 @@ html, body {
     if (s.stop) { try { s.stop(); } catch (e) {} s.stop = null; }
     var i;
     for (i = 0; i < s.srcs.length; i++) { try { s.srcs[i].stop(0); } catch (e) {} }
-    try { s.wIn.disconnect(); } catch (e) {}
-    try { s.wOut.disconnect(); s.wOut.connect(s.wet); } catch (e) {}
+    if (s.wIn) { try { s.wIn.disconnect(); } catch (e) {} }
+    if (s.wOut && s.wet) { try { s.wOut.disconnect(); s.wOut.connect(s.wet); } catch (e) {} }
     s.graph = false; s.set = null; s.srcs = [];
     if (s.on) { try { s.buildGraph(); } catch (e) {} }
     highlightFx();
@@ -1733,12 +1952,14 @@ html, body {
   function outNodeFor(idx) {
     var o = ensureChain().in;
     if (state.flags.stereo && ctx.createStereoPanner) {
-      try {
-        var p = ctx.createStereoPanner();
-        p.pan.value = (idx % 2) ? 0.4 : -0.4;
-        p.connect(o);
-        return p;
-      } catch (e) {}
+      if (!panners) {
+        try {
+          panners = [ctx.createStereoPanner(), ctx.createStereoPanner()];
+          panners[0].pan.value = -0.4; panners[1].pan.value = 0.4;
+          panners[0].connect(o); panners[1].connect(o);
+        } catch (e) { panners = null; }
+      }
+      if (panners) return panners[idx % 2];
     }
     return o;
   }
@@ -1750,6 +1971,11 @@ html, body {
     ensureChain();
     state.lastPad = idx + 1;
     var t = ctx.currentTime + 0.001;
+    /* Ре-триггер пэда глушит предыдущий голос того же пэда: иначе зацикленные
+       и длинные сэмплы складывались стопкой и съедали всю полифонию. */
+    var prev = padVoice[idx];
+    if (prev && !prev.dead) killVoice(prev, t, 0.015);
+    padVoice[idx] = null;
     var smp = getSample(state.bankIdx, idx + 1);
     if (smp) playSample(smp, idx, t);
     else playFactory(idx, t);
@@ -1783,7 +2009,7 @@ html, body {
     src.loop = !!state.flags.loop;
     src.playbackRate.value = rate;
     var dur = buf.duration / rate;
-    var rec = beginVoice(state.flags.loop ? t + 1e7 : t + dur + 0.06);
+    var rec = beginVoice(state.flags.loop ? t + 3600 : t + dur + 0.06);
     rec.sources.push(src);
     rec.g.connect(outNodeFor(idx));
     var g = ctx.createGain();
@@ -2234,6 +2460,16 @@ html, body {
       case 'del': deleteSampleAt(state.bankIdx, state.lastPad); break;
       case 'cancel':
       case 'cancelrec': if (rec.active) recStop(false); else showSlotsView(); break;
+      case 'perf': {
+        if (perf.auto) { perf.level = perf.detect; perf.auto = false; }
+        else perf.level = (perf.level + 1) % 3;
+        try { localStorage.setItem('sp404_perf', String(perf.level)); } catch (e) {}
+        hardResetAudio();
+        updatePerfBtn();
+        toast('Качество: ' + perfP().name + ' · ' +
+              (Math.round(perf.realRate / 100) / 10) + ' кГц · голосов ' + MAX_VOICES);
+        break;
+      }
     }
   }
 
@@ -2289,6 +2525,7 @@ html, body {
   }
   buildDigits(); renderDigits(bpmStr);
   setTimeout(function () {
+    if (!perfP().glow) return;
     try { digitSvg.style.filter = 'drop-shadow(0 0 3px rgba(255,60,30,.75))'; } catch (e) {}
   }, 60);
 
@@ -2556,6 +2793,7 @@ html, body {
     }
     readKnobs();
     highlightFx();
+    updatePerfBtn();
     idbInit();
     /* подсветить банк */
     var lit = root.querySelector('.bk[data-bank="' + state.banks[state.bankIdx] + '"]');
@@ -2580,7 +2818,9 @@ html, body {
       voices: n, max: MAX_VOICES, ctx: !!ctx, state: ctx ? ctx.state : 'none',
       bank: state.banks[state.bankIdx], mfx: state.mfx, flags: state.flags,
       k: state.k.slice(0), vol: state.vol, samples: countSamples(),
-      chain: !!chain, mods: mods, lastPad: state.lastPad, rec: rec.active
+      chain: !!chain, mods: mods, lastPad: state.lastPad, rec: rec.active,
+      perf: { level: perf.level, name: perfP().name, auto: perf.auto,
+              rate: perf.realRate, voices: MAX_VOICES, os: perfP().os }
     };
   };
 })();
